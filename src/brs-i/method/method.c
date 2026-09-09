@@ -25,6 +25,11 @@
 #define CID_PCI			"PNP0A03"
 #define HID_ECAM		"PNP0A08"
 
+/* ACPI Time and Alarm Device, same HID as src/acpi/devices/time/time.c. */
+#define HID_TAD			"ACPI000E"
+
+static bool no_osbus_rtc;
+
 static int method_brsi_init(fwts_framework *fw)
 {
 	if (fwts_acpi_init(fw) != FWTS_OK) {
@@ -319,6 +324,228 @@ static int method_brsi_aml030(fwts_framework *fw)
 	return FWTS_OK;
 }
 
+typedef struct {
+	fwts_framework *fw;
+	const char *id;
+	unsigned int found;
+	unsigned int failed;
+} method_brsi_tad_ctx;
+
+/*
+ * Evaluate `name` under `handle`.
+ * Optional `args` / `arg_count` are passed through (used by _SRT).
+ *
+ * On success:
+ *   Integer             -> *value = Integer.Value
+ *   Buffer named "_GRT" -> *value = Buffer.Length
+ */
+static bool method_brsi_eval(
+	ACPI_HANDLE handle,
+	char *name,
+	ACPI_OBJECT *args,
+	UINT32 arg_count,
+	uint64_t *value)
+{
+	ACPI_BUFFER buf = { ACPI_ALLOCATE_BUFFER, NULL };
+	ACPI_OBJECT_LIST arg_list;
+	ACPI_OBJECT *obj;
+	ACPI_STATUS status;
+	bool rc = false;
+
+	if (args && arg_count) {
+		arg_list.Count = arg_count;
+		arg_list.Pointer = args;
+		status = AcpiEvaluateObject(handle, name, &arg_list, &buf);
+	} else {
+		status = AcpiEvaluateObject(handle, name, NULL, &buf);
+	}
+	if (ACPI_FAILURE(status) || buf.Pointer == NULL)
+		return false;
+
+	obj = buf.Pointer;
+	if (obj->Type == ACPI_TYPE_INTEGER) {
+		rc = true;
+		if (value)
+			*value = obj->Integer.Value;
+	} else if (obj->Type == ACPI_TYPE_BUFFER && !strcmp(name, "_GRT")) {
+		rc = true;
+		if (value)
+			*value = obj->Buffer.Length;
+	}
+
+	ACPI_FREE(buf.Pointer);
+	return rc;
+}
+
+static ACPI_STATUS method_brsi_tad_walk(
+	ACPI_HANDLE handle,
+	UINT32 nesting_level,
+	void *context,
+	void **return_value)
+{
+	method_brsi_tad_ctx *ctx = context;
+	char device_path[128];
+	fwts_acpi_time_buffer real_time;
+	ACPI_OBJECT arg0;
+	uint64_t gcp = 0;
+	uint64_t grt_len = 0;
+	uint64_t srt = 0;
+	bool failed = false;
+
+	FWTS_UNUSED(nesting_level);
+	FWTS_UNUSED(return_value);
+
+	ctx->found++;
+
+	method_brsi_acpi_fullname(handle, device_path, sizeof(device_path));
+
+	fwts_log_info(ctx->fw, "%s: found TAD %s (HID %s).",
+		ctx->id, device_path, HID_TAD);
+
+	if (!method_brsi_eval(handle, "_GCP", NULL, 0, &gcp)) {
+		fwts_log_info(ctx->fw,
+			"%s: %s._GCP is mandatory but missing, failed "
+			"to evaluate, or did not return an Integer.",
+			ctx->id, device_path);
+		failed = true;
+	} else {
+		fwts_log_info(ctx->fw, "%s: %s._GCP returned 0x%" PRIx64 ".",
+			ctx->id, device_path, gcp);
+		if (gcp & ~0x1ff) {
+			fwts_log_info(ctx->fw,
+				"%s: %s._GCP reserved bits 9..31 are set.",
+				ctx->id, device_path);
+			failed = true;
+		} else if (!(gcp & 0x4)) {
+			fwts_log_info(ctx->fw,
+				"%s: %s._GCP bit 2 (get/set real time) is not set.",
+				ctx->id, device_path);
+			failed = true;
+		}
+	}
+
+	if (!method_brsi_eval(handle, "_GRT", NULL, 0, &grt_len)) {
+		fwts_log_info(ctx->fw,
+			"%s: %s._GRT is mandatory but missing, failed "
+			"to evaluate, or did not return a Buffer.",
+			ctx->id, device_path);
+		failed = true;
+	} else if (grt_len != sizeof(fwts_acpi_time_buffer)) {
+		fwts_log_info(ctx->fw,
+			"%s: %s._GRT returned a Buffer of %" PRIu64
+			" bytes, expected %zu.",
+			ctx->id, device_path, grt_len,
+			sizeof(fwts_acpi_time_buffer));
+		failed = true;
+	} else {
+		fwts_log_info(ctx->fw,
+			"%s: %s._GRT returned a %" PRIu64 "-byte time buffer.",
+			ctx->id, device_path, grt_len);
+	}
+
+	memset(&real_time, 0, sizeof(real_time));
+	real_time.year = 2000;
+	real_time.month = 1;
+	real_time.day = 1;
+	real_time.hour = 0;
+	real_time.minute = 0;
+	real_time.milliseconds = 1;
+	real_time.timezone = 0;
+
+	arg0.Type = ACPI_TYPE_BUFFER;
+	arg0.Buffer.Length = sizeof(real_time);
+	arg0.Buffer.Pointer = (void *)&real_time;
+
+	if (!method_brsi_eval(handle, "_SRT", &arg0, 1, &srt)) {
+		fwts_log_info(ctx->fw,
+			"%s: %s._SRT is mandatory but missing, failed "
+			"to evaluate, or did not return an Integer.",
+			ctx->id, device_path);
+		failed = true;
+	} else {
+		fwts_log_info(ctx->fw, "%s: %s._SRT returned 0x%" PRIx64 ".",
+			ctx->id, device_path, srt);
+	}
+
+	if (failed)
+		ctx->failed++;
+
+	return AE_OK;
+}
+
+static int method_brsi_aml060(fwts_framework *fw)
+{
+	method_brsi_tad_ctx ctx;
+
+	/*
+	 * AML_060 applies only when the platform has an RTC on a bus the
+	 * OS manages (I2C, SPI, ...). That cannot be discovered from ACPI,
+	 * so --brs-i-no-osbus-rtc declares that TAD is not required.
+	 */
+	if (no_osbus_rtc) {
+		fwts_skipped(fw,
+			"AML_060: --brs-i-no-osbus-rtc specified; no RTC on "
+			"an OS-managed bus, Time and Alarm Device is not "
+			"required.");
+		return FWTS_OK;
+	}
+
+	memset(&ctx, 0, sizeof(ctx));
+	ctx.fw = fw;
+	ctx.id = "AML_060";
+
+	AcpiGetDevices(HID_TAD, method_brsi_tad_walk, &ctx, NULL);
+
+	if (ctx.found == 0)
+		fwts_failed(fw, LOG_LEVEL_CRITICAL, "AML_060",
+			"No Time and Alarm Device (HID %s) found. Systems "
+			"with an RTC on an OS-managed bus MUST implement a "
+			"TAD with functioning _GCP (bit 2 set), _GRT and "
+			"_SRT. Re-run with --brs-i-no-osbus-rtc if this "
+			"system has no such RTC.",
+			HID_TAD);
+	else if (ctx.failed)
+		fwts_failed(fw, LOG_LEVEL_CRITICAL, "AML_060",
+			"%u of %u Time and Alarm Device(s) failed _GCP bit 2, "
+			"_GRT or _SRT.",
+			ctx.failed, ctx.found);
+	else
+		fwts_passed(fw,
+			"AML_060: %u Time and Alarm Device(s) implement "
+			"functioning _GCP (bit 2 set), _GRT and _SRT.",
+			ctx.found);
+
+	return FWTS_OK;
+}
+
+static int options_handler(
+	fwts_framework *fw,
+	int argc,
+	char * const argv[],
+	int option_char,
+	int long_index)
+{
+	FWTS_UNUSED(argc);
+	FWTS_UNUSED(argv);
+
+	if (option_char == 0) {
+		switch (long_index) {
+		case 0:	/* --brs-i-no-osbus-rtc */
+			no_osbus_rtc = true;
+			fwts_log_info(fw,
+				"BRS-I: no RTC on OS-managed bus, skip AML_060 check");
+			break;
+		}
+	}
+	return FWTS_OK;
+}
+
+static fwts_option options[] = {
+	{ "brs-i-no-osbus-rtc", "", 0,
+	  "Platform has no RTC on an OS-managed bus (skip AML_060)" },
+	{ NULL, NULL, 0, NULL }
+};
+
 static fwts_framework_minor_test method_brsi_tests[] = {
 	{ method_brsi_aml010,
 	  "AML_010: PCIe Root Complex _CRS SHOULD NOT return I/O ranges." },
@@ -326,6 +553,8 @@ static fwts_framework_minor_test method_brsi_tests[] = {
 	  "AML_020: _PRS and _SRS methods SHOULD NOT be implemented." },
 	{ method_brsi_aml030,
 	  "AML_030: per-hart devices MUST be under \\_SB, not \\_PR." },
+	{ method_brsi_aml060,
+	  "AML_060: TAD with _GCP bit 2, _GRT and _SRT if RTC is on an OS-managed bus." },
 	{ NULL, NULL }
 };
 
@@ -333,7 +562,9 @@ static fwts_framework_ops method_brsi_ops = {
 	.description = "RISC-V BRS-I ACPI Methods and Objects test.",
 	.init        = method_brsi_init,
 	.deinit      = method_brsi_deinit,
-	.minor_tests = method_brsi_tests
+	.minor_tests = method_brsi_tests,
+	.options     = options,
+	.options_handler = options_handler
 };
 
 FWTS_REGISTER("method_brsi", &method_brsi_ops, FWTS_TEST_ANYTIME, FWTS_FLAG_BRSI)
